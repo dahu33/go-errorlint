@@ -9,6 +9,15 @@ import (
 	"regexp"
 )
 
+var comparisonWhitelist = []struct {
+	err string
+	fun string
+}{
+	{err: "io.EOF", fun: "(io.Reader).Read"},
+	{err: "io.EOF", fun: "(*os.File).Read"},
+	{err: "sql.ErrNoRows", fun: "(*database/sql.Row).Scan"},
+}
+
 type Lint struct {
 	Message string
 	Pos     token.Position
@@ -119,6 +128,10 @@ func LintErrorComparisons(fset *token.FileSet, info types.Info) []Lint {
 			continue
 		}
 
+		if isAllowedErrorComparison(info, binExpr) {
+			continue
+		}
+
 		lints = append(lints, Lint{
 			Message: fmt.Sprintf("comparing with %s will fail on wrapped errors. Use errors.Is to check for a specific error", binExpr.Op),
 			Pos:     fset.Position(binExpr.Pos()),
@@ -163,6 +176,54 @@ func isErrorComparison(info types.Info, binExpr *ast.BinaryExpr) bool {
 	tx := info.Types[binExpr.X]
 	ty := info.Types[binExpr.Y]
 	return tx.Type.String() == "error" || ty.Type.String() == "error"
+}
+
+func isAllowedErrorComparison(info types.Info, binExpr *ast.BinaryExpr) bool {
+	var subject *ast.Ident
+	var errName string // "<package>.<name>"
+
+	for _, expr := range []ast.Expr{binExpr.X, binExpr.Y} {
+		switch t := expr.(type) {
+		case *ast.Ident:
+			// Identifier, most likely to be the `err` variable.
+			subject = t
+		case *ast.SelectorExpr:
+			// A selector which we assume is a package and error variable.
+			errName = selectorToString(t)
+		}
+	}
+
+	if errName == "" {
+		// Unimplemented or not sure.
+		return false
+	}
+
+	// Now where was the subject last assigned?
+	var fun string
+	if assignment, ok := subject.Obj.Decl.(*ast.AssignStmt); ok {
+		if callExpr, ok := assignment.Rhs[0].(*ast.CallExpr); ok {
+			sel := info.Selections[callExpr.Fun.(*ast.SelectorExpr)]
+			fun = fmt.Sprintf("(%s).%s", sel.Recv(), sel.Obj().Name())
+		}
+	}
+	if valueSpec, ok := subject.Obj.Decl.(*ast.ValueSpec); ok {
+		// TODO: Check by which function the error variable was last assigned.
+		_ = valueSpec
+	}
+
+	for _, w := range comparisonWhitelist {
+		if w.fun == fun && w.err == errName {
+			return true
+		}
+	}
+	return false
+}
+
+func selectorToString(selExpr *ast.SelectorExpr) string {
+	if ident, ok := selExpr.X.(*ast.Ident); ok {
+		return ident.Name + "." + selExpr.Sel.Name
+	}
+	return ""
 }
 
 func LintErrorTypeAssertions(fset *token.FileSet, info types.Info) []Lint {
